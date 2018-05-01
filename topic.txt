@@ -1,0 +1,575 @@
+::::::::::::::
+topic_modeling.py
+::::::::::::::
+
+# coding: utf-8
+
+import sys
+sys.path.append('src')
+import pandas as pd
+import logging
+import logging.config
+import yaml
+
+import parameters
+import model_helpers
+import preprocess_utils
+import df_utils
+import s3_utils
+
+def main():
+
+    # configure logging
+    logger = logging.getLogger(__name__)
+    path = 'src/logging.yaml'
+    with open(path, 'rt') as f:
+        config = yaml.safe_load(f.read())
+        logging.config.dictConfig(config)
+
+    # TASK 1: download raw translated data from s3 to local directory
+    logging.info("Task: save translated data from s3 to local directory")
+    key = parameters.S3_RAW_DATA_PATH
+    s3_utils.download_file_from_s3(key, parameters.RAW_DATA_PATH)
+    logging.info("Task completed")
+
+    # TASK 2: load raw translated data from local directory
+    logging.info("Task: load data from local directory")
+    data = pd.read_table(parameters.RAW_DATA_PATH,
+                         index_col = parameters.INDEX_COLUMN,
+                         names = parameters.COL_NAMES,
+                         skiprows = 1,
+                         delimiter='|')
+    logging.info("Task completed")
+
+    # TASK 3: clean data (preprocess text column for topic modeling)
+    logging.info("Task: clean data")
+    data_cln = preprocess_utils.clean_consolidated_data(data)
+    logging.info("Task completed")
+
+    # TASK 4: generate topic modeling output
+    logging.info("Task: generate corpus and dictionary from clean data")
+    corpus, dictionary = model_helpers.create_dict_and_corpus(data_cln)
+    logging.info("Task completed")
+
+    logging.info("Task: generate and format lda topic modeling output")
+    all_topic_df, final_corpus_df, all_ngram_df = model_helpers.get_lda_output(data = data_cln, n_topics = 3, level = 0, level_id = 0, corpus = corpus, dictionary = dictionary) # generate 3 topics with the cln data
+    all_topic_df.loc[:,'next_lvl_assignment'] = all_topic_df['next_lvl_assignment'] + 1 # topics 0,1,2 -> 1,2,3 (index these 3 topics beginning at 1)
+    all_ngram_df.loc[:,'Topic_ID'] = all_ngram_df['Topic_ID'] + 1 # topics 0,1,2 -> 1,2,3 (index these 3 topics beginning at 1)
+    formatted_all_topic_df, formatted_ngram_df = model_helpers.format_nested_lda_output(all_topic_df, all_ngram_df, data_cln, corpus, dictionary) # format the topic assignments
+    topic_prob_df = model_helpers.get_final_lda_topic_prob_df(formatted_all_topic_df) # get final topic assignments & probabilities
+    tableau_radial_df = model_helpers.get_final_lda_tableau_formatted_df(topic_prob_df, data_cln) # get final tableau formatted radial df
+    topic_prob_df.rename(columns = {'level': 'Topic_Level', 'level_id': 'Topic_ID', 'next_lvl_topic_prob': 'Topic_Probability'}, inplace = True)
+    logging.info("Task completed")
+
+    # TASK 5: save results to local folder
+    logging.info("Task: save results to local folder")
+    data_path_pairs = [
+        (topic_prob_df, parameters.TOPIC_ASSIGN_PATH),
+        (tableau_radial_df, parameters.TABLEAU_RADIAL_PATH),
+        (final_corpus_df, parameters.FINAL_CORPUS_PATH),
+        (formatted_ngram_df, parameters.TOPIC_NGRAM_PATH)
+    ]
+
+    save = lambda df_path: df_utils.standard_csv_save(df_path[0], df_path[1], add_date = False)
+    df_utils.for_each(save, data_path_pairs)
+    logging.info("Task completed")
+
+    # TASK 6: save results to s3
+    logging.info("Task: save results to s3")
+    s3_data_path_pairs = [
+        (parameters.TOPIC_ASSIGN_PATH, parameters.S3_TOPIC_ASSIGN_PATH),
+        (parameters.TABLEAU_RADIAL_PATH, parameters.S3_TABLEAU_RADIAL_PATH),
+        (parameters.FINAL_CORPUS_PATH, parameters.S3_FINAL_CORPUS_PATH),
+        (parameters.TOPIC_NGRAM_PATH, parameters.S3_TOPIC_NGRAM_PATH)
+    ]
+
+    save = lambda path_key: s3_utils.write_file_to_s3(path_key[0], path_key[1])
+    #df_utils.for_each(save, s3_data_path_pairs)
+    logging.info("Task completed")
+
+    logging.shutdown()
+
+if __name__ == "__main__":
+    main()
+
+
+::::::::::::::
+df_utils.py
+::::::::::::::
+from gensim.matutils import corpus2dense
+from scipy.sparse import coo_matrix
+
+import pandas as pd
+import datetime
+import os.path
+
+def dcast_coo(coo_mat, coo_column_names, new_column_names, row_names, row_dim_name = 'row_id', col_dim_name = 'col_id', v
+alue_name = 'value'):
+    '''Convert/downcast a scipy.sparse.coo_matrix into a skinny dataframe of the non-zero elements.'''
+    row2ids =  dict( list(zip( list(range( len(row_names))), row_names )) )
+    idx2word = dict( list(zip( list(range( len(coo_column_names))), coo_column_names)))
+    row_gen = ((row2ids[row_idx], idx2word[col_idx], n) for (row_idx, col_idx, n) in iter_coo(coo_mat) if col_idx in new_
+column_names)
+    return pd.DataFrame.from_records(data = row_gen, columns = [row_dim_name, col_dim_name, value_name])
+
+def iter_coo(coo_mat):
+    '''Iterate over the non-zero (row index, column index, value) tuples in a scipy.sparse.coo_matrix'''
+    return list(zip(coo_mat.row, coo_mat.col, coo_mat.data))
+
+def gensim_corpus_to_df(corpus, dictionary, data):
+        corpus_df = corpus2dense(corpus, num_terms=len(dictionary))
+        corpus_coo = coo_matrix(corpus_df.T)
+        corpus_final = dcast_coo(corpus_coo, coo_column_names = list(dictionary.values()), new_column_names = list(dictio
+nary.keys()), row_names = data.index, row_dim_name = 'Index', col_dim_name = 'Ngram', value_name = 'Frequency')
+        return(corpus_final)
+
+def standard_csv_save(df, save_path, add_date, encoding = 'utf8', **kwargs):
+    '''Save a DataFrame as a csv with standard (for my preferences) settings.'''
+    if add_date == True:
+        now = datetime.datetime.now()
+        date_str = now.strftime('_%Y%m%d')
+        save_path = os.path.splitext(save_path)[0] + date_str + os.path.splitext(save_path)[1]
+    df.to_csv(save_path, header = True, index = False, encoding = encoding, **kwargs)
+
+def for_each(fn, *iterables):
+    '''Apply function to every item of iterable and return no value. Relies on side effects.'''
+    for args in zip(*iterables):
+        fn(*args)
+::::::::::::::
+__init__.py
+::::::::::::::
+::::::::::::::
+model_helpers.py
+::::::::::::::
+import parameters
+import preprocess_utils
+import df_utils
+
+import pandas as pd
+from gensim.models import Phrases, LdaModel
+from gensim.corpora import Dictionary
+
+def create_dict_and_corpus(data):
+    texts = [text.split() for text in data[parameters.PREPROCESSED]] # split into tokens
+    bigram = Phrases(texts)
+    texts = [bigram[doc] for doc in texts] # get bigrams
+    trigram = Phrases(bigram[texts])
+    texts = [trigram[bigram[text]] for text in texts] # get trigrams
+    dictionary = Dictionary(texts)
+    dictionary.filter_extremes(no_below=.05, no_above = .4, keep_n=500)
+    new_texts = [[x for x in t if x in list(dictionary.values())] for t in texts] # sloooooow
+    corpus = [dictionary.doc2bow(text) for text in new_texts]
+    return(corpus,dictionary)
+
+def create_lda_model(corpus, dictionary, n_topics):
+    n_topics = n_topics
+    lda = LdaModel(corpus=corpus,
+                   id2word=dictionary,
+                   random_state=parameters.SEED,
+                   num_topics = n_topics,
+                   iterations = 500,
+                   eta = .01,
+                   alpha = .001)
+    return(lda)
+
+def get_lda_topic_df(lda, corpus, data, level, level_id):
+    lda_topic_df = pd.DataFrame()
+    top_ngrams_df = pd.DataFrame()
+
+    lda_corpus = lda[corpus]
+    lda_topic_dict = [dict(x) for x in lda_corpus] # get topic assignments
+    lda_top_topic = [max(lda_topic_dict[x], key=lda_topic_dict[x].get) for x in range(len(corpus))] # get top topic assig
+nment
+    lda_top_topic_prob = [lda_topic_dict[x][lda_top_topic[x]] for x in range(len(corpus))] # get top topic probability
+
+    lda_topic_df = pd.DataFrame([lda_top_topic, lda_top_topic_prob]).T
+    lda_topic_df.index = data.index
+    lda_topic_df.columns = ['next_lvl_assignment', 'next_lvl_topic_prob']
+    lda_topic_df['level'] = level
+    lda_topic_df['level_id'] = level_id
+    return(lda_topic_df)
+
+def get_lda_topic_words(lda,num_words):
+    all_ngram_df = pd.DataFrame()
+    for topic in lda.show_topics(num_words = num_words, formatted=False):
+        topic_ngram_df = pd.DataFrame(topic[1], columns = ['Ngram', 'Topic_Probability'])
+        topic_ngram_df['Topic_ID'] = topic[0]
+        all_ngram_df = pd.concat([all_ngram_df, topic_ngram_df])
+    return(all_ngram_df)
+
+def get_lda_output(data, n_topics, level, level_id, corpus, dictionary):
+    #corpus, dictionary = create_dict_and_corpus(data)
+    final_corpus = df_utils.gensim_corpus_to_df(corpus, dictionary, data)
+    lda = create_lda_model(corpus, dictionary, n_topics)
+    lda_topic_df = get_lda_topic_df(lda, corpus, data, level, level_id)
+    topic_ngram_df = get_lda_topic_words(lda, num_words = 10)
+    return(lda_topic_df, final_corpus, topic_ngram_df)
+
+def get_data_subset(lda_topic_df, data):
+    for topic_num in lda_topic_df['next_lvl_assignment'].unique():
+        ix_to_use = lda_topic_df.index[lda_topic_df['next_lvl_assignment'] == topic_num]
+        data_sub = data[data.index.isin(ix_to_use)]
+        yield data_sub,topic_num
+
+def realign_topic_prob(nlda_topic_assign_prob_df):
+    cln_nlda_topic_assign_prob_df = pd.DataFrame()
+    for level in nlda_topic_assign_prob_df['level'].unique():
+        data_sub = nlda_topic_assign_prob_df[nlda_topic_assign_prob_df['level'] == level]
+        if level == 0:
+            correct_topic_assign_sub = 1.0
+        else:
+            correct_topic_assign_sub = nlda_topic_assign_prob_df['next_lvl_topic_prob'][nlda_topic_assign_prob_df['level'
+] == level - 1].copy()
+        data_sub.loc[:, ('next_lvl_topic_prob')] = correct_topic_assign_sub
+        cln_nlda_topic_assign_prob_df = pd.concat([cln_nlda_topic_assign_prob_df, data_sub])
+    return(cln_nlda_topic_assign_prob_df)
+
+def get_final_lda_topic_prob_df(all_topic_df):
+    temp = pd.DataFrame(all_topic_df[['next_lvl_assignment', 'next_lvl_topic_prob']][all_topic_df['level'] ==1])
+    temp.columns = ['level_id', 'next_lvl_topic_prob']
+    temp['level'] = 2
+
+    nlda_topic_assign_prob_df = pd.concat([all_topic_df[['level', 'level_id', 'next_lvl_topic_prob']], temp]).sort_index(
+)
+    nlda_topic_assign_df = pd.concat([all_topic_df[['level', 'level_id']], temp[['level','level_id']]]).sort_index()
+
+    cln_nlda_topic_assign_prob_df = realign_topic_prob(nlda_topic_assign_prob_df)
+    cln_nlda_topic_assign_prob_df.reset_index(drop= False)
+    cln_nlda_topic_assign_prob_df['Index'] = cln_nlda_topic_assign_prob_df.index
+
+    #cln_nlda_topic_assign_prob_df.rename(columns = {'level': 'Topic_Level', 'level_id': 'Topic_ID', 'next_lvl_topic_prob
+': 'Topic_Probability'}, inplace = True)
+    return(cln_nlda_topic_assign_prob_df)
+
+def format_hlda_tableau_radial_graph(hlda_topic_assign_df):
+    temp = pd.DataFrame(hlda_topic_assign_df.groupby(['Level_0_ID'])['Level_2_ID'].count())
+    temp.columns = ['Count']
+    temp['Level'] = 0
+    temp['Category_Label'] = temp.index
+    temp['Product_Category'] = temp['Category_Label'].astype(str)
+    temp = temp[['Category_Label', 'Product_Category', 'Level', 'Count']]
+    temp.reset_index(inplace = True, drop = True)
+    temp_level_0 = temp
+
+    temp = pd.DataFrame(hlda_topic_assign_df.groupby(['Level_1_ID'])['Level_2_ID'].count())
+    temp.columns = ['Count']
+    temp['Level'] = 1
+    temp['Category_Label'] = temp.index
+    temp['Product_Category'] = '0 > ' + temp['Category_Label'].astype(str)
+    temp = temp[['Category_Label', 'Product_Category', 'Level', 'Count']]
+    temp.reset_index(inplace = True, drop = True)
+    temp_level_1 = temp
+
+    temp = pd.DataFrame(hlda_topic_assign_df.groupby(['Level_2_ID'])['Level_2_ID'].count())
+    temp.columns = ['Count']
+    temp['Level_2_ID'] = temp.index
+    temp = temp.merge(hlda_topic_assign_df, how = 'inner', on = 'Level_2_ID').drop_duplicates()
+    temp['Level'] = 2
+    temp.rename(columns = {'Level_2_ID': 'Category_Label'}, inplace = True)
+    temp['Product_Category'] = temp['Level_0_ID'].astype(str) + ' > ' + temp['Level_1_ID'].astype(str) + ' > '+ temp['Cat
+egory_Label'].astype(str)
+    temp = temp[['Category_Label', 'Product_Category', 'Level', 'Count']]
+    temp.reset_index(inplace = True, drop = True)
+    temp_level_2 = temp
+
+    tableau_format_df = pd.concat([temp_level_0, temp_level_1, temp_level_2])
+    tableau_format_df.rename(columns = {'Category_Label': 'Parent Category Label', 'Product_Category' : 'Product Category
+', 'Count': 'Sales'}, inplace = True)
+    #tableau_format_df['Number of Records'] = 1
+    tableau_format_df['Path'] = 1
+    #tableau_format_df['Actual Sales'] = tableau_format_df['Sales']
+    tableau_format_df_copy = tableau_format_df.copy()
+    tableau_format_df_copy['Path'] = 203
+
+    final_tableau_format_df = pd.concat([tableau_format_df, tableau_format_df_copy])
+    return(final_tableau_format_df)
+
+def format_nested_lda_output(all_topic_df, all_ngram_df, data_cln, corpus, dictionary):
+    counter = 4
+    corpus_df = pd.DataFrame(corpus, index = data_cln.index)
+    for data_sub,topic_num in get_data_subset(all_topic_df, data_cln):
+        corpus_sub = [[_f for _f in list(corpus_df.ix[ix]) if _f] for ix in data_sub.index]
+        l1_top_topic_df, final_corpus, ngram_df = get_lda_output(data_sub, 3, level = 1, level_id = topic_num, corpus = c
+orpus_sub, dictionary = dictionary)
+        repls = dict(list(zip([0,1,2], list(range(counter,(counter+3))))))
+        l1_top_topic_df['next_lvl_assignment'].replace(repls, inplace = True)
+        ngram_df['Topic_ID'].replace(repls, inplace = True)
+        all_topic_df = pd.concat([all_topic_df, l1_top_topic_df])
+        all_ngram_df = pd.concat([all_ngram_df, ngram_df])
+        counter += 3
+    return(all_topic_df, all_ngram_df)
+
+def get_final_lda_tableau_formatted_df(topic_assign_df, data):
+    pvt_topic_assign_df = topic_assign_df.pivot(columns = 'level', values='level_id')
+    pvt_topic_assign_df = pvt_topic_assign_df.add_prefix('Level_')
+    pvt_topic_assign_df = pvt_topic_assign_df.add_suffix('_ID')
+
+    tableau_formatted_df = pd.DataFrame()
+
+    for country in data[parameters.FILE_COUNTRY].unique():
+        data_sub = data[data[parameters.FILE_COUNTRY] == country]
+        pvt_topic_assign_df_sub = pvt_topic_assign_df.ix[data_sub.index]
+        tableau_formatted_df_temp =  format_hlda_tableau_radial_graph(pvt_topic_assign_df_sub)
+        tableau_formatted_df_temp['Country'] = country
+
+        tableau_formatted_df = pd.concat([tableau_formatted_df, tableau_formatted_df_temp])
+    tableau_formatted_df_sub = tableau_formatted_df[['Parent Category Label','Product Category','Level','Sales','Path','C
+ountry']]
+    tableau_formatted_df_sub.rename(columns = {'Parent Category Label': 'Topic_ID', 'Product Category': 'Topic_Path','Lev
+el':'Topic_Level','Sales': 'Clue_Count'}, inplace = True)
+    return(tableau_formatted_df_sub)
+::::::::::::::
+parameters.py
+::::::::::::::
+import configparser
+from os import path
+
+# AWS ACCESS
+config = configparser.ConfigParser()
+config.read(path.expanduser("~/.aws/credentials"))
+AWS_ACCESS_KEY_ID = config.get('svc-gbi-veeva-rw-s3', "aws_access_key_id")
+AWS_SECRET_ACCESS_KEY = config.get('svc-gbi-veeva-rw-s3', "aws_secret_access_key")
+
+BUCKET_NAME = "pfe-baiaes-eu-w1"
+S3_RAW_DATA_PATH = 'VEEVA/Translated/translated_final2.txt'
+S3_TOPIC_ASSIGN_PATH = 'VEEVA/Results/topic_modeling_assignments.csv'
+S3_TABLEAU_RADIAL_PATH = 'VEEVA/Results/topic_modeling_tableau_radial.csv'
+S3_FINAL_CORPUS_PATH = 'VEEVA/Results/topic_modeling_final_corpus.csv'
+S3_TOPIC_NGRAM_PATH = 'VEEVA/Results/topic_modeling_topic_ngrams.csv'
+#DATA_KEY = "VEEVA/Translated/"
+#RESULTS_KEY = "VEEVA/Results/"
+
+RAW_DATA_PATH = 'data/raw/translated_final2.txt'
+SYNONYMS_PATH = 'data/synonyms.csv'
+STOP_WORDS_BLACKLIST_PATH = 'data/stopwords_blacklist.csv'
+STOP_WORDS_WHITELIST_PATH = 'data/stopwords_whitelist.csv'
+TOPIC_ASSIGN_PATH = 'data/processed/topic_modeling_assignments.csv'
+TABLEAU_RADIAL_PATH = 'data/processed/topic_modeling_tableau_radial.csv'
+FINAL_CORPUS_PATH = 'data/processed/topic_modeling_final_corpus.csv'
+TOPIC_NGRAM_PATH = 'data/processed/topic_modeling_topic_ngrams.csv'
+HEADER_COLUMN = 0
+INDEX_COLUMN = 0
+ID_NAME = 'id'
+PREPROCESSED = 'preprocessed_text'
+TEXT_COLUMN = 'Clue'
+QUESTION = 'Customer_Clue'
+FILE_COUNTRY = 'File_Country'
+FILE_DATE = 'File_Date'
+FILE_PATH = 'File_Path'
+REGION = 'Region'
+LOCATION = 'Location'
+
+SEED = 1492
+
+COL_NAMES = ['index',
+             'File_Path',
+             'File_Date',
+             'File_Country',
+             'Interview_ID',
+             'Customer_Clue',
+             'Clue',
+             'Place_type',
+             'Region',
+             'Brand',
+             'Specialty1',
+             'Specialty2',
+             'InterviewDate',
+             'Type_of_meeting',
+             'Created_By_Full_Name',
+             'Created Date']
+
+IX_TO_DROP = [1409,
+              2038,
+              5317,
+              5460,
+              5729,
+              6446,
+              6803,
+              10326,
+              10585,
+              10859,
+              10990,
+              11160]
+::::::::::::::
+preprocess_utils.py
+::::::::::::::
+from nltk.tokenize import RegexpTokenizer
+from nltk.stem import WordNetLemmatizer
+from nltk import corpus
+
+from inflection import singularize
+import string
+import csv
+import re
+import numpy as np
+
+import parameters
+
+printable = set(string.printable)
+
+def get_custom_synonyms(SYNONYMS_PATH):
+    if SYNONYMS_PATH != None:
+        with open(SYNONYMS_PATH, 'r', encoding = 'utf-8') as csv_file:
+            reader = csv.reader(csv_file)
+            SYNONYMS = dict(reader)
+    else:
+        SYNONYMS = []
+    return SYNONYMS
+
+def get_custom_stop_words(STOP_WORDS_BLACKLIST_PATH, STOP_WORDS_WHITELIST_PATH):
+    if STOP_WORDS_BLACKLIST_PATH != None:
+        with open(STOP_WORDS_BLACKLIST_PATH, 'r', encoding = 'utf-8') as csv_file:
+            reader = csv.reader(csv_file)
+            stop_words_list = list(reader)
+            STOP_WORDS = [val for sublist in stop_words_list for val in sublist]
+    elif STOP_WORDS_BLACKLIST_PATH == None:
+        STOP_WORDS = []
+
+    stop_words_list = corpus.stopwords.words('english')
+    stop_words_list.extend(STOP_WORDS)
+
+    if STOP_WORDS_WHITELIST_PATH != None:
+        with open(STOP_WORDS_WHITELIST_PATH, 'r', encoding = 'utf-8') as csv_file:
+            reader = csv.reader(csv_file)
+            keep_words_list = list(reader)
+            KEEP_WORDS = [val for sublist in keep_words_list for val in sublist]
+            for word in KEEP_WORDS:
+                try:
+                    stop_words_list.remove(word)
+                except:
+                    pass
+
+    return stop_words_list
+
+def remove_ascii(string):
+    if type(string) is str:
+        clean_string = [x for x in string if x in printable] # remove ascii characters
+        return str(clean_string)
+
+def clean_text(text):
+    synonyms_list = get_custom_synonyms(parameters.SYNONYMS_PATH)
+    stop_words_list = get_custom_stop_words(parameters.STOP_WORDS_BLACKLIST_PATH, parameters.STOP_WORDS_WHITELIST_PATH)
+    tokenizer = RegexpTokenizer(r'\w+')
+    lemmatizer = WordNetLemmatizer()
+
+    if type(text) is str:
+        text = text.lower()
+        #cln_text = remove_ascii(text)
+        cln_text = re.sub('[^a-zA-Z]+', ' ', text) # remove digits/symbols, text to lowercase
+        cln_text_tkns = tokenizer.tokenize(cln_text)
+        cln_text_tkns = [synonyms_list[word] if word in synonyms_list else word for word in cln_text_tkns] # replace acro
+nyms/abbreviations
+        cln_text_tkns = [i for i in cln_text_tkns if not i in stop_words_list] # remove stop words
+        cln_text_tkns = [singularize(word) for word in cln_text_tkns]
+        cln_text_tkns =  [' '.join([lemmatizer.lemmatize(word, pos='v') for word in text.split()]) for text in cln_text_t
+kns]
+        cln_text_str = ' '.join(cln_text_tkns)
+    else:
+        cln_text_str = ''
+    return cln_text_str
+
+def clean_region(dataframe):
+    dataframe[parameters.REGION].replace({'0': None}, inplace = True)
+    loc_repls = dict()
+    for original_loc in dataframe[parameters.REGION].unique():
+        loc_to_use = ''
+        if type(original_loc) is str:
+            #loc_to_use = remove_ascii(original_loc)# remove ascii characters
+            m = re.search(r"\[([A-Za-z0-9_\-]+)\]", original_loc) # search for text from brackets
+            try:
+                loc_to_use = m.group(1) # extract text from brackets
+            except:
+                pass
+        elif type(original_loc) is not str:
+            continue
+        if original_loc == loc_to_use.title(): # if original loc already formatted correctly, do not add to dict
+            #print "Skipping this one *%s* it is already formatted correctly" % (original_loc)
+            continue
+        elif original_loc != loc_to_use.title():
+            loc_repls[original_loc] = loc_to_use.title()
+    dataframe[parameters.REGION].replace(loc_repls, inplace = True)
+    dataframe[parameters.REGION].replace({'Trentino-Sdtirol': 'Trentino-Sudtirol'}, inplace = True)
+    dataframe[parameters.REGION].replace({np.nan: ' '}, inplace = True)
+    return dataframe[parameters.REGION]
+
+def clean_country(data):
+    file_path1 = '../Data/processed/english_only/13-10-2017_english\\kmCurrent customer insight database Ireland 2017_GP.
+csv'
+    file_path2 = '../Data/processed/english_only/14-09-2017_english\\Clues_ KOLs Medical_raport_EN_Guidelines summary.csv
+'
+    data[parameters.FILE_COUNTRY][data[parameters.FILE_PATH] == file_path1] = 'Ireland' # set File_FILE_COUNTRY
+    data[parameters.FILE_COUNTRY][data[parameters.FILE_PATH] == file_path2] = 'United Kingdom' # set File_FILE_COUNTRY
+    data[parameters.FILE_COUNTRY].replace({'IT': 'Italy', 'TR': 'Turkey', 'Belgium/Luxemborg': 'Belgium'}, inplace = True
+) # replace FILE_COUNTRY codes with FILE_COUNTRY names
+    return data[parameters.FILE_COUNTRY]
+
+def get_location(dataframe):
+    dataframe.loc[:, parameters.LOCATION] = dataframe[parameters.REGION].str.cat(dataframe[parameters.FILE_COUNTRY], sep=
+', ')
+    dataframe.loc[:, parameters.LOCATION] = dataframe[parameters.LOCATION].astype(str)
+    dataframe.loc[:, parameters.LOCATION] = dataframe[parameters.LOCATION].apply(lambda x: x.lstrip(' , '))
+    return dataframe[parameters.LOCATION]
+
+def clean_consolidated_data(data):
+    # drop records with known issues
+    data = data.drop(data.index[parameters.IX_TO_DROP]) # remove records that were read in incorrectly
+    # clean questions
+    data = data[~(data[parameters.QUESTION].isnull()) | (data[parameters.QUESTION].str.lower().str.contains("trial|custom
+er clue")==True)] # drop questions from Veeva testing
+    # clean regions
+    data.loc[:, parameters.REGION] = clean_region(data)
+    data.loc[:, parameters.REGION] = data[parameters.REGION].fillna('')
+    data[parameters.REGION].str.cat(data[parameters.FILE_COUNTRY], sep=', ')
+    # clean countries
+    data.loc[:, parameters.FILE_COUNTRY] = clean_country(data)
+    # get location
+    data.loc[:, parameters.LOCATION] = get_location(data)
+    # preprocess main text column
+    data.loc[:, parameters.PREPROCESSED] = data[parameters.TEXT_COLUMN].apply(lambda x: clean_text(x))
+    data = data.dropna(axis = 0, subset = [parameters.PREPROCESSED]) # drop records where preprocessed text is null
+    data = data[data[parameters.PREPROCESSED] != ''] # drop records where text column is an empty string
+    clues_to_drop = ['test', 'answer', 'test answer', 'test response', 'bla bla', 'question number']
+    data = data[~data[parameters.PREPROCESSED].str.contains('|'.join(clues_to_drop))] # drop clues from Veeva testing
+    data = data.drop_duplicates([parameters.FILE_PATH, parameters.PREPROCESSED]) # drop duplicates that have same text an
+d are from same extract
+    return data
+
+::::::::::::::
+s3_utils.py
+::::::::::::::
+import parameters
+
+import boto
+from boto.s3.key import Key
+
+def download_file_from_s3(key, write_file):
+    """
+    Download a file from s3 to local
+    :param key: string, key on s3
+    :param write_file: string, the path to write the file
+    :return:
+    """
+    try:
+        s3conn = boto.connect_s3(parameters.AWS_ACCESS_KEY_ID, parameters.AWS_SECRET_ACCESS_KEY)
+        bucket = s3conn.get_bucket(parameters.BUCKET_NAME)
+        k = boto.s3.key.Key(bucket)
+        k.key = key
+        k.get_contents_to_filename(write_file)
+    except Exception as e:
+        raise
+
+def write_file_to_s3(read_file, key):
+    """
+    Write local file into s3 bucket
+    :param read_file: string, local file to write to s3
+    :param key: string, key on s3
+    :return:
+    """
+    try:
+        s3conn = boto.connect_s3(parameters.AWS_ACCESS_KEY_ID, parameters.AWS_SECRET_ACCESS_KEY)
+        bucket = s3conn.get_bucket(parameters.BUCKET_NAME)
+        k = boto.s3.key.Key(bucket)
+        k.key = key
+        k.set_contents_from_filename(read_file)
+    except Exception as e:
+        raise
